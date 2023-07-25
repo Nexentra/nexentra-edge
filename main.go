@@ -1,42 +1,99 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sync"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/nexentra/nexentraedge/admin"
+	"github.com/nexentra/nexentraedge/container"
+	"github.com/nexentra/nexentraedge/db"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"gorm.io/gorm"
 )
 
-var containerManager ContainerManager
+var containerManager container.ContainerManager
+var gormDbInstance *gorm.DB
+var err error
+var srv = &http.Server{
+	Addr: ":80",
+}
 
 func main() {
-	repo := &InMemoryServiceDefinitionRepository{
-		services: make(map[string]ServiceDefinition),
-		mutex:    &sync.Mutex{},
+	// logging
+	debug := flag.Bool("debug", false, "sets log level to debug")
+	flag.Parse()
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if *debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
-	manager := NewServiceDefinitionManager(repo)
-	go StartAdminServer(manager)
-	containerManager = NewDockerContainerManager(manager)
+
+	// sqlite db instance
+	gormDbInstance, err = db.NewSqliteDB()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to create sqlite db")
+		panic(err)
+	}
+
+	// admin service/server
+	repo := admin.NewSqliteServiceDefinitionRepository(gormDbInstance)
+	manager := admin.NewServiceDefinitionManager(repo)
+	go admin.StartAdminServer(manager)
+
+	// container manager
+	containerManager, err = container.NewDockerContainerManager(manager)
+	if err != nil {
+		fmt.Printf("Failed to create container manager: %s\n", err)
+		return
+	}
+
+	// setup http server
 	http.HandleFunc("/", handler)
-	fmt.Println("Starting nexentraedge serverless reverse proxy server on port 80")
-	http.ListenAndServe(":8080", nil)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal().Err(err).Msg("Failed to start http server")
+		}
+	}()
+
+	// gracefull shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start http server")
+	}
+	errList := containerManager.StopAndRemoveAllContainers()
+	if len(errList) > 0 {
+		log.Error().Errs("errors", errList).Msg("Failed to stop and remove containers")
+	} else {
+		log.Info().Msg("Stopped and removed all containers")
+	}
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	// handle admin requests
-	if r.Host == AdminHost {
-		proxyToURL(w, r, fmt.Sprintf("%s:%d", "localhost", AdminPort))
+	if r.Host == admin.AdminHost {
+		proxyToURL(w, r, fmt.Sprintf("%s:%d", "localhost", admin.AdminPort))
 		return
 	}
 
 	svcLocalHost, err := containerManager.GetRunningServiceForHost(r.Host)
 	if err != nil {
-		fmt.Printf("Failed to get running service: %s\n", err)
+		log.Error().Err(err).Msg("Failed to get running service")
 		w.Write([]byte("Failed to get running service"))
 		return
 	}
-	fmt.Printf("Proxying to %s\n", *svcLocalHost)
+	log.Debug().Str("host", r.Host).Str("service localhost", *svcLocalHost).Msg("proxying request")
 	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
 		Scheme: "http",
 		Host:   *svcLocalHost,
